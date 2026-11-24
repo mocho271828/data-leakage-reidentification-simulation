@@ -1,0 +1,3 @@
+known_identity_percent,mask,service,trials,successes,rate,lower95,upper95,decision,total_targets,mean_correct,mean_incorrect,mean_unresolved,correct_rate,incorrect_rate,unresolved_rate,mean_health,mean_seen,all_seen_rate,seen_rate
+100,2,A,400,339,0.8475,0.8089761434535727,0.8794128119840912,reached,4000,9.8275,0.0,0.1725,0.98275,0.0,0.01725,9.8275,9.8275,0.8475,0.98275
+90,2,A,400,305,0.7625,0.7184235572819022,0.8015824881925919,uncertain,4000,9.7325,0.0,0.2675,0.97325,0.0,0.02675,9.7325,9.85,0.8575,0.985

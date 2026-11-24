@@ -1,0 +1,34 @@
+{
+  "project_revision": "1ba530f",
+  "date_JST": "2026-11-25",
+  "service": "A",
+  "population": 73322000,
+  "population_seed_of_reference": 2026,
+  "registrants": 18330500,
+  "past_size": 4399320,
+  "past_count": 15,
+  "targets": 10,
+  "mask": 2,
+  "health_recorded_percent": 100,
+  "seed_ranges": {
+    "100": [
+      726000,
+      726399
+    ],
+    "90": [
+      727000,
+      727399
+    ]
+  },
+  "repetitions_per_group": 400,
+  "primary": "All ten matched correctly. Denominator is all 400 trials in each group.",
+  "secondary": "Mean correct, incorrect, unresolved and health revealed per trial.",
+  "per_group_interval": "Two-sided 95% Wilson score without continuity correction",
+  "difference": "90% group minus 100% group, independent two-sample two-sided 95% Newcombe method 10",
+  "decision": "lower95 >= 0.8 reached; upper95 < 0.8 below; otherwise uncertain",
+  "design": "Exact finite-population projection for A unique unchanged email, independent per-past-row known status. Raw-reference seeds not pooled with main study.",
+  "reference_seeds": {
+    "100": 725100,
+    "90": 725101
+  }
+}
