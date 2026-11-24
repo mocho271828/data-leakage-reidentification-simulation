@@ -4,6 +4,7 @@ use clap::Parser;
 use rand::seq::index;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha12Rng;
+use serde::Deserialize;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -23,6 +24,9 @@ struct Args {
     /// 厳密境界の直前・直後の4配置を別シードで各200万回確認する。
     #[arg(long)]
     boundary_confirm: bool,
+    /// 会社の規模が異なる条件を標準入力のJSONで受け取り、境界前後を同時に抽選する。
+    #[arg(long, conflicts_with = "boundary_confirm")]
+    size_study: bool,
 }
 
 struct Layout {
@@ -42,17 +46,22 @@ impl Layout {
 
     fn cyclic(k: usize, nested: bool) -> Self {
         let label = if nested { "nested" } else { "balanced" };
-        let mut layout = Self::new(label, vec![SERVICE_SIZE as usize; k]);
         let pool = if nested {
             SERVICE_SIZE as usize
         } else {
             TARGET_SIZE
         };
-        for service in 0..k {
-            for slot in 0..SERVICE_SIZE as usize {
-                let target = (service * SERVICE_SIZE as usize + slot) % pool;
-                layout.services_by_target[target].push(service);
+        Self::cyclic_blocks(label, vec![SERVICE_SIZE as usize; k], pool)
+    }
+
+    fn cyclic_blocks(label: &'static str, overlap: Vec<usize>, pool: usize) -> Self {
+        let mut layout = Self::new(label, overlap);
+        let mut offset = 0;
+        for (service, &common) in layout.overlap.iter().enumerate() {
+            for target in offset..offset + common {
+                layout.services_by_target[target % pool].push(service);
             }
+            offset = (offset + common) % pool;
         }
         layout
     }
@@ -101,23 +110,41 @@ impl Layout {
 #[derive(Default, Clone, Copy)]
 struct ServiceDraw {
     processed: u32,
-    hit120: u32,
-    hit240: u32,
+    small_hits: u32,
+    large_hits: u32,
+}
+
+#[derive(Clone, Copy)]
+struct SamplingFrame {
+    roster: u32,
+    small: u32,
+    large: u32,
 }
 
 impl ServiceDraw {
-    // 抽選順位を120人・次の120人・残り760人の3群に分け、残った枠数から非復元抽出する。
-    fn observe(&mut self, position: u32) -> [bool; 2] {
-        let hit120 = position < 120 - self.hit120;
-        let hit240 = position < 240 - self.hit240;
+    // 少人数の漏えいを大人数の抽選に含め、各条件の残り人数で判定する。
+    fn observe(&mut self, position: u32, frame: SamplingFrame) -> [bool; 2] {
+        let small = position < frame.small - self.small_hits;
+        let large = position < frame.large - self.large_hits;
         self.processed += 1;
-        self.hit120 += u32::from(hit120);
-        self.hit240 += u32::from(hit240);
-        [hit120, hit240]
+        self.small_hits += u32::from(small);
+        self.large_hits += u32::from(large);
+        [small, large]
     }
 }
 
-fn trial(layout: &Layout, draws: &mut [ServiceDraw], seed: u64) -> [usize; 3] {
+const STANDARD_FRAME: SamplingFrame = SamplingFrame {
+    roster: SERVICE_SIZE,
+    small: 120,
+    large: 240,
+};
+
+fn trial(
+    layout: &Layout,
+    frames: &[SamplingFrame],
+    draws: &mut [ServiceDraw],
+    seed: u64,
+) -> [usize; 3] {
     draws.fill(ServiceDraw::default());
     let mut rng = ChaCha12Rng::seed_from_u64(seed);
     let mut correct = [0; 3];
@@ -126,8 +153,9 @@ fn trial(layout: &Layout, draws: &mut [ServiceDraw], seed: u64) -> [usize; 3] {
         let mut seen = [false; 2];
         for &service in services {
             let draw = &mut draws[service];
-            let position = rng.random_range(0..SERVICE_SIZE - draw.processed);
-            let hits = draw.observe(position);
+            let frame = frames[service];
+            let position = rng.random_range(0..frame.roster - draw.processed);
+            let hits = draw.observe(position, frame);
             seen[0] |= hits[0];
             seen[1] |= hits[1];
         }
@@ -178,8 +206,9 @@ fn measure(
     let mut successes = [0; 3];
     let mut totals = [0; 3];
     let mut draws = vec![ServiceDraw::default(); k];
+    let frames = vec![STANDARD_FRAME; k];
     for i in 0..trials {
-        for (j, correct) in trial(&layout, &mut draws, first_seed + i as u64)
+        for (j, correct) in trial(&layout, &frames, &mut draws, first_seed + i as u64)
             .into_iter()
             .enumerate()
         {
@@ -231,6 +260,73 @@ fn explore(out: &mut impl Write) -> Result<()> {
     Ok(())
 }
 
+#[derive(Deserialize)]
+struct SizeBoundary {
+    profile: String,
+    rule: String,
+    roster: [u32; 2],
+    common: [usize; 2],
+    leaked: [u32; 2],
+    first_services: usize,
+    exact: [f64; 2],
+}
+
+impl SizeBoundary {
+    fn measure(&self, out: &mut impl Write) -> Result<()> {
+        const SEED: u64 = 12_000_000;
+        const REPEATS: usize = 200_000;
+        let k = self.first_services;
+        ensure!((1..=2000).contains(&k), "境界の社数が計画外です");
+        for t in 0..2 {
+            ensure!(
+                self.common[t] > 0
+                    && self.common[t] <= self.roster[t] as usize
+                    && self.leaked[t] <= self.roster[t],
+                "登録・共通・漏えい人数が整合しません"
+            );
+        }
+        ensure!(
+            TARGET_SIZE.is_multiple_of(self.common.iter().sum()),
+            "1万人を2社1組の群に分割できません"
+        );
+        let layout = Layout::cyclic_blocks(
+            "alternating",
+            (0..k).map(|s| self.common[s % 2]).collect(),
+            TARGET_SIZE,
+        );
+        // 最後の会社だけ一方の漏えい枠をゼロにして、同じ抽選でK−1社とK社を比較する。
+        let frames: Vec<_> = (0..k)
+            .map(|s| SamplingFrame {
+                roster: self.roster[s % 2],
+                small: if s + 1 == k { 0 } else { self.leaked[s % 2] },
+                large: self.leaked[s % 2],
+            })
+            .collect();
+        let mut draws = vec![ServiceDraw::default(); k];
+        let mut successes = [0usize; 2];
+        for i in 0..REPEATS {
+            let result = trial(&layout, &frames, &mut draws, SEED + i as u64);
+            for j in 0..2 {
+                successes[j] += usize::from(result[j] == NEW_SIZE);
+            }
+        }
+        for (j, hits) in successes.into_iter().enumerate() {
+            let services = k - 1 + j;
+            let rate = hits as f64 / REPEATS as f64;
+            let (lo, hi) = wilson(hits, REPEATS);
+            let exact = self.exact[j];
+            writeln!(
+                out,
+                "{},{},A,{services},{SEED},{REPEATS},{hits},{rate:.8},{lo:.8},{hi:.8},{exact:.15},{}",
+                self.profile,
+                self.rule,
+                (lo..=hi).contains(&exact)
+            )?;
+        }
+        Ok(())
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     ensure!(!args.output.try_exists()?, "既存の出力ファイルを保護します");
@@ -240,22 +336,34 @@ fn main() -> Result<()> {
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     let mut stage = tempfile::NamedTempFile::new_in(parent)?;
-    writeln!(
-        stage,
-        "services,profile,mean_overlap,layout,d,m,leak_percent,first_seed,trials,all_correct,rate,lower95,upper95,decision,mean_correct,ideal_probability"
-    )?;
-    if args.boundary_confirm {
-        for k in [139, 140, 298, 299] {
-            measure(
-                Layout::cyclic(k, false),
-                "equal",
-                9_100_000,
-                2_000_000,
-                &mut stage,
-            )?;
+    if args.size_study {
+        let boundaries: Vec<SizeBoundary> = serde_json::from_reader(std::io::stdin().lock())?;
+        ensure!(!boundaries.is_empty(), "検証対象がありません");
+        writeln!(
+            stage,
+            "profile,rule,first_type,services,first_seed,trials,all_correct,rate,lower95,upper95,exact,exact_in_interval"
+        )?;
+        for boundary in boundaries {
+            boundary.measure(&mut stage)?;
         }
     } else {
-        explore(&mut stage)?;
+        writeln!(
+            stage,
+            "services,profile,mean_overlap,layout,d,m,leak_percent,first_seed,trials,all_correct,rate,lower95,upper95,decision,mean_correct,ideal_probability"
+        )?;
+        if args.boundary_confirm {
+            for k in [139, 140, 298, 299] {
+                measure(
+                    Layout::cyclic(k, false),
+                    "equal",
+                    9_100_000,
+                    2_000_000,
+                    &mut stage,
+                )?;
+            }
+        } else {
+            explore(&mut stage)?;
+        }
     }
     stage.flush()?;
     stage.persist_noclobber(args.output)?;
@@ -296,10 +404,10 @@ mod tests {
         let mut pair_counts = [[0u32; 3]; 3];
         for first in 0..SERVICE_SIZE {
             let mut draw = ServiceDraw::default();
-            let [a, b] = draw.observe(first);
+            let [a, b] = draw.observe(first, STANDARD_FRAME);
             for second in 0..SERVICE_SIZE - 1 {
                 let mut rest = draw;
-                let [c, d] = rest.observe(second);
+                let [c, d] = rest.observe(second, STANDARD_FRAME);
                 pair_counts[usize::from(a) + usize::from(b)][usize::from(c) + usize::from(d)] += 1;
             }
         }
@@ -312,6 +420,38 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn two_people_in_two_unequal_rosters_match_exhaustive_probability() {
+        // 3人中1人、続いて5人中2人が漏えい。共通の2人が両方現れる確率は
+        // 1 − 2 × (2/3)(3/5) + (1/3)(3/10) = 3/10。
+        let cases = |n, leaked| {
+            let mut outcomes = Vec::new();
+            let frame = SamplingFrame {
+                roster: n,
+                small: leaked,
+                large: leaked,
+            };
+            for a in 0..n {
+                let mut first = ServiceDraw::default();
+                let first_hit = first.observe(a, frame)[1];
+                for b in 0..n - 1 {
+                    let mut second = first;
+                    outcomes.push([first_hit, second.observe(b, frame)[1]]);
+                }
+            }
+            outcomes
+        };
+        let first = cases(3, 1);
+        let second = cases(5, 2);
+        let mut both_seen = 0;
+        for a in &first {
+            for b in &second {
+                both_seen += usize::from((a[0] || b[0]) && (a[1] || b[1]));
+            }
+        }
+        assert_eq!(10 * both_seen, 3 * first.len() * second.len());
     }
 
     #[test]
@@ -329,5 +469,34 @@ mod tests {
             assert_eq!(nested.coverage(), (1000, 1000));
         }
         assert!(ideal_probability(9779) < 0.8 && ideal_probability(9780) >= 0.8);
+    }
+
+    #[test]
+    fn heterogeneous_cycle_with_full_leaks_covers_exactly_the_first_blocks() {
+        let overlap: Vec<_> = (0..20).map(|s| [250, 750][s % 2]).collect();
+        let layout = Layout::cyclic_blocks("alternating", overlap, TARGET_SIZE);
+        assert_eq!(layout.coverage(), (TARGET_SIZE, 0));
+        let frames: Vec<_> = (0..20)
+            .map(|s| {
+                let size = [750, 1250][s % 2];
+                SamplingFrame {
+                    roster: size,
+                    small: if s == 19 { 0 } else { size },
+                    large: size,
+                }
+            })
+            .collect();
+        let mut draws = vec![ServiceDraw::default(); frames.len()];
+        for seed in 0..50 {
+            let mut rng = ChaCha12Rng::seed_from_u64(seed);
+            let before = index::sample(&mut rng, TARGET_SIZE, NEW_SIZE)
+                .into_iter()
+                .filter(|&t| t < TARGET_SIZE - 750)
+                .count();
+            assert_eq!(
+                trial(&layout, &frames, &mut draws, seed),
+                [before, NEW_SIZE, NEW_SIZE]
+            );
+        }
     }
 }

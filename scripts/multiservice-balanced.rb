@@ -2,50 +2,114 @@
 
 require_relative 'multiservice-bounds'
 
-# 実行: ruby scripts/multiservice-balanced.rb
-class BalancedServiceLeaks
-  def initialize(group_size:, groups:, sample_size:, leaked:)
-    @size, @groups, @sample = group_size, groups, sample_size
-    raise ArgumentError unless groups.positive? && group_size.positive? &&
-                               (1..groups * group_size).cover?(sample_size) && (0..group_size).cover?(leaked)
+# 1群の共通登録者は、残りの登録者とともに同じ名簿から非復元抽出される。
+class FixedServiceCohort
+  attr_reader :common, :denominator
 
-    @sample_count = MultiServiceBounds.choose(@size * @groups, @sample)
-    @degree = [@size, @sample].min
-    # 指定した i 人が過去1社の固定人数抽出で全員外れる確率。整数だけで累乗・包除する。
+  def initialize(roster:, common:, leaked:, sample:)
+    raise ArgumentError unless roster.positive? && (1..roster).cover?(common) &&
+                               (0..roster).cover?(leaked) && sample.positive?
+
+    @common, @degree = common, [common, sample].min
+    @miss_rate = (roster - leaked).fdiv(roster)
     missed = (0..@degree).map do |i|
-      Rational(MultiServiceBounds.choose(@size - leaked, i), MultiServiceBounds.choose(@size, i))
+      Rational(MultiServiceBounds.choose(roster - leaked, i), MultiServiceBounds.choose(roster, i))
     end
     @denominator = missed.map(&:denominator).reduce(1, :lcm)
     @numerators = missed.map { |p| p.numerator * (@denominator / p.denominator) }
     @by_incidents = {}
   end
 
+  def expected_covered(incidents)
+    @common * (1 - @miss_rate**incidents)
+  end
+
   def group_coefficients(incidents)
     @by_incidents[incidents] ||= begin
       missed = @numerators.map { |count| count**incidents }
       (0..@degree).map do |j|
-        # j人全員が過去に登場する確率の分子に、そのj人の選び方を掛ける。
+        # 指定したj人が全員1回以上登場する確率を包除で求め、選び方の数を掛ける。
         hits = (0..j).sum { |i| (i.even? ? 1 : -1) * MultiServiceBounds.choose(j, i) * missed[i] }
-        MultiServiceBounds.choose(@size, j) * hits
+        MultiServiceBounds.choose(@common, j) * hits
       end
     end
   end
+end
+
+class CyclicServiceLeaks
+  def initialize(cohorts:, sample:)
+    @cohorts, @sample = cohorts, sample
+    @population = @cohorts.sum(&:common)
+    raise ArgumentError unless (1..@population).cover?(@sample)
+
+    @sample_count = MultiServiceBounds.choose(@population, @sample)
+  end
 
   def probability(services)
-    raise ArgumentError if services.negative?
-
-    rounds, extra = services.divmod(@groups)
+    denominator = @sample_count
     coefficients = [1]
-    @groups.times do |group|
-      factor = group_coefficients(rounds + (group < extra ? 1 : 0))
+    each_exposure(services) do |cohort, incidents|
+      next if incidents.zero?
+
+      factor = cohort.group_coefficients(incidents)
+      denominator *= cohort.denominator**incidents
       # 全群から合計n人を引く。次数nを超えた項は最終結果に寄与しない。
-      coefficients = Array.new([coefficients.size + @degree, @sample + 1].min) do |j|
-        ([0, j - @degree].max..[j, coefficients.size - 1].min).sum do |k|
+      coefficients = Array.new([coefficients.size + factor.size - 1, @sample + 1].min) do |j|
+        ([0, j - factor.size + 1].max..[j, coefficients.size - 1].min).sum do |k|
           coefficients[k] * factor[j - k]
         end
       end
     end
-    Rational(coefficients.fetch(@sample), @sample_count * @denominator**services)
+    Rational(coefficients.fetch(@sample, 0), denominator)
+  end
+
+  def multiple_registrants(services)
+    each_exposure(services).sum { |cohort, incidents| incidents >= 2 ? cohort.common : 0 }
+  end
+
+  def first_crossing(target, limit)
+    # 1人の正答確率だけを使う近似で探索開始点を選ぶ。採否は前後の厳密な分数で判定する。
+    k = (1..limit).bsearch do |s|
+      mean = each_exposure(s).sum { |cohort, incidents| cohort.expected_covered(incidents) }
+      (mean / @population)**@sample >= target
+    end || limit
+    at = probability(k)
+    while at < target
+      return if k == limit
+
+      k += 1
+      at = probability(k)
+    end
+    before = probability(k - 1)
+    while k > 1 && before >= target
+      k -= 1
+      at = before
+      before = probability(k - 1)
+    end
+    [k, before, at]
+  end
+
+  private
+
+  def each_exposure(services)
+    raise ArgumentError if services.negative?
+    return enum_for(__method__, services) unless block_given?
+
+    rounds, extra = services.divmod(@cohorts.size)
+    @cohorts.each_with_index { |cohort, i| yield cohort, rounds + (i < extra ? 1 : 0) }
+  end
+end
+
+class BalancedServiceLeaks < CyclicServiceLeaks
+  def initialize(group_size:, groups:, sample_size:, leaked:)
+    raise ArgumentError unless groups.positive?
+
+    @cohort = FixedServiceCohort.new(roster: group_size, common: group_size, leaked: leaked, sample: sample_size)
+    super(cohorts: [@cohort] * groups, sample: sample_size)
+  end
+
+  def group_coefficients(incidents)
+    @cohort.group_coefficients(incidents)
   end
 end
 
