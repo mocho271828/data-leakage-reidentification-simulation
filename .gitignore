@@ -1,2 +1,4 @@
 /target/
 /output/
+/temp_gates/
+.DS_Store
