@@ -1,5 +1,6 @@
 /target/
 /output/
 /temp_gates/
+/presentation/
 .DS_Store
 docs/発表内容.md

@@ -8,4 +8,6 @@
 - [照合と採点の分離](policy_gates/evaluation.md)
 - [依存の利用と出力の保護](policy_gates/implementation.md)
 
+発表用スライドとその素材・書き出しは `presentation/` にまとめ, Gitの追跡対象から外す.
+
 検証時は上の3ファイルを `temp_gates/yyyy-mm-dd-hh-mm-ss/` へコピーし, 各コピーにチェックと判定を記入する. 不合格条件に該当する場合は該当欄にチェックを付け, 判定をNOとする.
